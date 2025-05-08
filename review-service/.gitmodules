@@ -1,3 +1,4 @@
+# git submodule update --init --recursive
 [submodule "review-service/api"]
     path = review-service/api
     url = https://github.com/Q1mi/reviewapis.git

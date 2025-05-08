@@ -6,6 +6,10 @@ import (
 	"errors"
 	"fmt"
 
+	"strconv"
+	"strings"
+	"time"
+
 	"review-service/internal/biz"
 	"review-service/internal/data/model"
 	"review-service/internal/data/query"
@@ -13,6 +17,8 @@ import (
 
 	"github.com/elastic/go-elasticsearch/v8/typedapi/types"
 	"github.com/go-kratos/kratos/v2/log"
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -222,6 +228,11 @@ func (r *reviewRepo) ListReviewByUserID(ctx context.Context, userID int64, offse
 
 // ListReviewByStoreID 根据storeID查询所有评价
 func (r *reviewRepo) ListReviewByStoreID(ctx context.Context, storeID int64, offset, limit int) ([]*biz.MyReviewInfo, error) {
+	// return r.getData1(ctx, storeID, offset, limit) // 第一版直接查ES
+	return r.getData2(ctx, storeID, offset, limit) // 第二版增加缓存和singlefilght
+}
+
+func (r *reviewRepo) getData1(ctx context.Context, storeID int64, offset, limit int) ([]*biz.MyReviewInfo, error) {
 	// 去ES里面查询评价
 	resp, err := r.data.es.Search().
 		Index("review").
@@ -261,5 +272,132 @@ func (r *reviewRepo) ListReviewByStoreID(ctx context.Context, storeID int64, off
 	return list, nil
 }
 
+func (r *reviewRepo) getData2(ctx context.Context, storeID int64, offset, limit int) ([]*biz.MyReviewInfo, error) {
+	// 取数据
+	// 1. 先查询redis缓存
+	// 2. 缓存没有则查ES
+	// 3. 通过 singleflight 合并短时间内大量的并发请求
+
+	key := fmt.Sprintf("review:%d:%d:%d", storeID, offset, limit)
+
+	b, err := r.getDataBySingleflight(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	// hm == req.Hits
+	hm := new(types.HitsMetadata)
+
+	if err := json.Unmarshal(b, hm); err != nil {
+		r.log.Errorf("json.UnmarshalJSON failed, err:%v", err)
+		return nil, err
+	}
+
+	// 反序列化数据
+	// resp.Hits.Hits[0].Source_(json.RawMessage)  ==>  model.ReviewInfo
+	list := make([]*biz.MyReviewInfo, 0, hm.Total.Value) // ?
+	// list := make([]*model.ReviewInfo)                           // ?
+
+	for _, hit := range hm.Hits {
+		tmp := &biz.MyReviewInfo{}
+		if err := json.Unmarshal(hit.Source_, tmp); err != nil {
+			r.log.Errorf("json.UnmarshalJSON failed, err:%v", err)
+			continue
+		}
+		list = append(list, tmp)
+	}
+
+	return list, nil
+}
+
+// key review:storeID:offset:limit --> "[{},{},{}]"
+// key review:123:1:10
+// json.unmarshal([]byte)
+
+var g singleflight.Group
+
+// getDataBySingleflight 通过 singleflight 合并短时间内大量的并发请求
+func (r *reviewRepo) getDataBySingleflight(ctx context.Context, key string) ([]byte, error) {
+	v, err, shared := g.Do(key, func() (interface{}, error) {
+		// 1. 先查询redis缓存
+		data, err := r.getDataFromCache(ctx, key)
+		r.log.Debugf("getDataFromCache, key:%s, data:%s, err:%v", key, data, err)
+		if err == nil {
+			return data, nil
+		}
+		// 2. 只有在redis缓存没有这个key时查ES
+		if errors.Is(err, redis.Nil) {
+			// 2.1 查询ES
+			data, err = r.getDataFromES(ctx, key)
+			if err == nil {
+				// 2.2 设置缓存
+				if err := r.setCache(ctx, key, data); err != nil {
+					r.log.Errorf("setCache failed, err:%v", err)
+				}
+				return data, nil
+			}
+			return nil, err
+		}
+		// 查缓存失败了，直接返回错误，不向下传导压力
+		return nil, err
+	})
+	r.log.Debugf("getDataBySingleflight, v:%s, err:%v, shared:%v", v, err, shared)
+	if err != nil {
+		return nil, err
+	}
+	return v.([]byte), nil
+}
+
 // 返回 []byte 是因为 json.Unmarshal() 传入的 hit.Source_ 也是 []byte 类型，
 // 直接将原始的数据存入缓存，使得缓存和ES一致
+// getDataFromCache 读缓存
+func (r *reviewRepo) getDataFromCache(ctx context.Context, key string) ([]byte, error) {
+	r.log.Debugf("getDataFromCache, key:%s", key)
+	return r.data.rdb.Get(ctx, key).Bytes()
+}
+
+// setCache 设置缓存
+func (r *reviewRepo) setCache(ctx context.Context, key string, data []byte) error {
+	return r.data.rdb.Set(ctx, key, data, time.Second*10).Err()
+}
+
+// getDataFromES 从ES查询数据
+func (r *reviewRepo) getDataFromES(ctx context.Context, key string) ([]byte, error) {
+	values := strings.Split(key, ":")
+	if len(values) != 4 {
+		return nil, errors.New("key format error")
+	}
+	index, storeID, offsetStr, limitStr := values[0], values[1], values[2], values[3]
+
+	offset, err := strconv.Atoi(offsetStr)
+	if err != nil {
+		return nil, err
+	}
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := r.data.es.Search().
+		Index(index).
+		From(offset).
+		Size(limit).
+		Query(&types.Query{
+			Bool: &types.BoolQuery{
+				Filter: []types.Query{
+					{
+						Term: map[string]types.TermQuery{
+							"store_id": {Value: storeID},
+						},
+					},
+				},
+			},
+		}).
+		Do(ctx)
+	fmt.Printf("--> es search: %v %v\n", resp, err)
+	if err != nil {
+		return nil, err
+	}
+
+	return json.Marshal(resp.Hits)
+}
