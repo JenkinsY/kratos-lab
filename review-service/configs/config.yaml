@@ -1,0 +1,25 @@
+server:
+  http:
+    addr: 0.0.0.0:8282
+    timeout: 1s
+  grpc:
+    addr: 0.0.0.0:9292
+    timeout: 1s
+data:
+  database:
+    driver: mysql
+    source: root:123456@tcp(127.0.0.1:3306)/review?parseTime=True&loc=Local
+  redis:
+    addr: 127.0.0.1:6379
+    read_timeout: 0.2s
+    write_timeout: 0.2s
+snowflake:
+  start_time: "2023-10-01"
+  machine_id: 1
+registry:
+  consul:
+    addr: 127.0.0.1:8500
+    scheme: http
+elsticsearch:
+  addr:
+    - http://127.0.0.1:9200
